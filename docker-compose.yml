@@ -1,6 +1,5 @@
-# Optional: run Redis locally for development.
-# Run: docker compose up -d
-# Then REDIS_URL=redis://localhost:6379/0 in .env
+# One command: docker compose up --build
+# Runs: API (port 8000), Worker, Redis, Postgres
 services:
   redis:
     image: redis:7-alpine
@@ -9,5 +8,47 @@ services:
     volumes:
       - redis_data:/data
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ingestion
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
+    depends_on:
+      redis:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
 volumes:
   redis_data:
+  postgres_data:
