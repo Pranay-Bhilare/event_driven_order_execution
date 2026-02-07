@@ -1,0 +1,13 @@
+# Optional: run Redis locally for development.
+# Run: docker compose up -d
+# Then REDIS_URL=redis://localhost:6379/0 in .env
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
