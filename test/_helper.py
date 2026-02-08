@@ -61,6 +61,14 @@ async def fetch_events_for_order(order_id: str, database_url: str | None = None)
         await conn.close()
 
 
+def get_queue_length(redis_url: str | None = None) -> int:
+    """Return current length of Redis main queue (queue:ingestion_events)."""
+    import redis
+    url = redis_url or REDIS_URL
+    r = redis.from_url(url, decode_responses=True)
+    return r.llen("queue:ingestion_events")
+
+
 def get_dlq_length(redis_url: str | None = None) -> int:
     """Return current length of Redis DLQ (queue:ingestion_events:dlq)."""
     import redis

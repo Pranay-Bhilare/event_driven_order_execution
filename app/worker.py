@@ -95,6 +95,8 @@ async def process_one_redis(
             )
             return
         try:
+            if settings.db_slowdown_ms > 0:
+                await asyncio.sleep(settings.db_slowdown_ms / 1000.0)
             inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
             if inserted:
                 logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
@@ -185,6 +187,8 @@ async def process_one_sqs(
             )
             return
         try:
+            if settings.db_slowdown_ms > 0:
+                await asyncio.sleep(settings.db_slowdown_ms / 1000.0)
             inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
             if inserted:
                 logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
