@@ -1,5 +1,5 @@
-# One command: docker compose up --build
-# Runs: API (port 8000), Worker, Redis, Postgres
+ # One command: docker compose up --build
+# Runs: API (8000), Worker (metrics 9090), Redis, Postgres, Prometheus (9091), Grafana (3000)
 services:
   redis:
     image: redis:7-alpine
@@ -28,6 +28,7 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
@@ -40,6 +41,9 @@ services:
   worker:
     build: .
     command: ["python", "-m", "app.worker"]
+    ports:
+      - "9090:9090"
+    env_file: .env
     environment:
       REDIS_URL: redis://redis:6379/0
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ingestion
@@ -49,6 +53,35 @@ services:
       postgres:
         condition: service_healthy
 
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    depends_on:
+      - api
+      - worker
+
+  grafana:
+    image: grafana/grafana:10.2.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+
 volumes:
   redis_data:
   postgres_data:
+  grafana_data:

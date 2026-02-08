@@ -1,7 +1,8 @@
 """
-Worker: pull messages from Redis queue (BRPOP), insert into Postgres.
-- Exponential backoff on failure; after max retries, move to DLQ.
-- Graceful shutdown on SIGTERM (finish in-flight tasks then exit).
+Worker: pull messages from Redis or AWS SQS, insert into Postgres.
+- Redis: exponential backoff + manual DLQ. SQS: don't delete on failure; SQS redrive to DLQ after max receives.
+- Prometheus /metrics on port 9090 (worker metrics).
+- Graceful shutdown on SIGTERM.
 Run: python -m app.worker
 """
 import asyncio
@@ -9,13 +10,16 @@ import json
 import logging
 import signal
 import sys
+import threading
 import time
 
 import redis.asyncio as redis
 
 from app.config import settings
 from app.db import close_pool, get_pool, init_schema, insert_event
+from app.metrics import messages_dlq_total, messages_failed_total, messages_processed_total
 from app.queue import INGESTION_DLQ_KEY, INGESTION_QUEUE_KEY
+from app.sqs_client import change_message_visibility, delete_message, receive_messages
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,18 +30,20 @@ logger = logging.getLogger(__name__)
 
 BRPOP_TIMEOUT = 5
 GRACEFUL_SHUTDOWN_WAIT_SEC = 30
+WORKER_METRICS_PORT = 9090
 
 
-async def process_one(
+def _start_metrics_server() -> None:
+    from prometheus_client import start_http_server
+    start_http_server(WORKER_METRICS_PORT)
+
+
+async def process_one_redis(
     r: redis.Redis,
     pool,
     raw: str,
     sem: asyncio.Semaphore,
 ) -> None:
-    """
-    Process a single message. On failure: exponential backoff then re-queue
-    (with attempts+1); after max retries, push to DLQ.
-    """
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -56,9 +62,12 @@ async def process_one(
             inserted = await insert_event(pool, event_id, source, payload)
             if inserted:
                 logger.info("Processed event_id=%s", event_id)
+                messages_processed_total.inc()
             else:
                 logger.info("Duplicate event_id=%s (UNIQUE constraint), skipped", event_id)
+                messages_processed_total.inc()
         except Exception as e:
+            messages_failed_total.inc()
             logger.exception("Failed to process event_id=%s (attempt %d): %s", event_id, attempts + 1, e)
             next_attempts = attempts + 1
             if next_attempts >= settings.worker_max_retries:
@@ -71,6 +80,7 @@ async def process_one(
                     "failed_at": time.time(),
                 })
                 await r.lpush(INGESTION_DLQ_KEY, dlq_message)
+                messages_dlq_total.inc()
                 logger.warning("Moved event_id=%s to DLQ after %d attempts", event_id, settings.worker_max_retries)
             else:
                 backoff_sec = 2 ** attempts
@@ -85,17 +95,54 @@ async def process_one(
                 await r.lpush(INGESTION_QUEUE_KEY, retry_message)
 
 
-async def run_worker(shutdown_event: asyncio.Event) -> None:
+async def process_one_sqs(
+    pool,
+    body: str,
+    receipt_handle: str,
+    receive_count: int,
+    sem: asyncio.Semaphore,
+) -> None:
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        logger.warning("Invalid JSON from SQS")
+        return
+    event_id = data.get("event_id")
+    source = data.get("source", "order_updates")
+    payload = data.get("payload") or {}
+    if not event_id:
+        logger.warning("Message missing event_id, skipping")
+        return
+
+    async with sem:
+        try:
+            inserted = await insert_event(pool, event_id, source, payload)
+            if inserted:
+                logger.info("Processed event_id=%s", event_id)
+                messages_processed_total.inc()
+                await asyncio.to_thread(delete_message, receipt_handle)
+            else:
+                logger.info("Duplicate event_id=%s (UNIQUE constraint), skipped", event_id)
+                messages_processed_total.inc()
+                await asyncio.to_thread(delete_message, receipt_handle)
+        except Exception as e:
+            messages_failed_total.inc()
+            logger.exception("Failed to process event_id=%s (receive #%d): %s", event_id, receive_count, e)
+            # Don't delete: message will reappear after visibility timeout; after max receives SQS moves to DLQ
+            backoff = min(2 ** receive_count, 900)
+            await asyncio.to_thread(change_message_visibility, receipt_handle, backoff)
+
+
+async def run_worker_redis(shutdown_event: asyncio.Event) -> None:
     pool = await get_pool()
     await init_schema(pool)
     sem = asyncio.Semaphore(settings.worker_concurrency)
     logger.info(
-        "Schema ready. Listening on %s (concurrency=%d, max_retries=%d) ...",
+        "Schema ready. Backend=Redis. Listening on %s (concurrency=%d, max_retries=%d) ...",
         INGESTION_QUEUE_KEY,
         settings.worker_concurrency,
         settings.worker_max_retries,
     )
-
     r = redis.from_url(settings.redis_url, decode_responses=True)
     tasks: set[asyncio.Task] = set()
     try:
@@ -104,13 +151,13 @@ async def run_worker(shutdown_event: asyncio.Event) -> None:
             if result is None:
                 continue
             _key, raw = result
-            t = asyncio.create_task(process_one(r, pool, raw, sem))
+            t = asyncio.create_task(process_one_redis(r, pool, raw, sem))
             tasks.add(t)
             t.add_done_callback(tasks.discard)
     finally:
         if tasks:
             logger.info("Graceful shutdown: waiting for %d in-flight task(s) (max %ds) ...", len(tasks), GRACEFUL_SHUTDOWN_WAIT_SEC)
-            done, pending = await asyncio.wait(tasks, timeout=GRACEFUL_SHUTDOWN_WAIT_SEC, return_when=asyncio.ALL_COMPLETED)
+            _, pending = await asyncio.wait(tasks, timeout=GRACEFUL_SHUTDOWN_WAIT_SEC, return_when=asyncio.ALL_COMPLETED)
             for t in pending:
                 t.cancel()
             if pending:
@@ -120,7 +167,50 @@ async def run_worker(shutdown_event: asyncio.Event) -> None:
         logger.info("Worker stopped.")
 
 
+async def run_worker_sqs(shutdown_event: asyncio.Event) -> None:
+    pool = await get_pool()
+    await init_schema(pool)
+    sem = asyncio.Semaphore(settings.worker_concurrency)
+    logger.info(
+        "Schema ready. Backend=SQS. Queue=%s (concurrency=%d) ...",
+        settings.sqs_queue_url,
+        settings.worker_concurrency,
+    )
+    tasks: set[asyncio.Task] = set()
+    try:
+        while not shutdown_event.is_set():
+            messages = await asyncio.to_thread(receive_messages, 10, 5)
+            for msg in messages:
+                body = msg.get("Body") or "{}"
+                receipt = msg.get("ReceiptHandle") or ""
+                attrs = msg.get("Attributes") or {}
+                receive_count = int(attrs.get("ApproximateReceiveCount", 1))
+                t = asyncio.create_task(process_one_sqs(pool, body, receipt, receive_count, sem))
+                tasks.add(t)
+                t.add_done_callback(tasks.discard)
+    finally:
+        if tasks:
+            logger.info("Graceful shutdown: waiting for %d in-flight task(s) (max %ds) ...", len(tasks), GRACEFUL_SHUTDOWN_WAIT_SEC)
+            _, pending = await asyncio.wait(tasks, timeout=GRACEFUL_SHUTDOWN_WAIT_SEC, return_when=asyncio.ALL_COMPLETED)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        await close_pool()
+        logger.info("Worker stopped.")
+
+
+async def run_worker(shutdown_event: asyncio.Event) -> None:
+    if settings.sqs_queue_url:
+        await run_worker_sqs(shutdown_event)
+    else:
+        await run_worker_redis(shutdown_event)
+
+
 def main() -> None:
+    threading.Thread(target=_start_metrics_server, daemon=True).start()
+    logger.info("Metrics server listening on port %s", WORKER_METRICS_PORT)
+
     shutdown_event = asyncio.Event()
 
     def on_signal():
@@ -131,7 +221,6 @@ def main() -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, on_signal)
     except NotImplementedError:
-        # Windows may not support add_signal_handler
         signal.signal(signal.SIGTERM, lambda *a: shutdown_event.set())
         signal.signal(signal.SIGINT, lambda *a: shutdown_event.set())
 

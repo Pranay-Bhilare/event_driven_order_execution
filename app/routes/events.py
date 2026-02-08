@@ -2,8 +2,9 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from app.redis_client import check_idempotency
+from app.metrics import events_ingested_total
 from app.queue import push_to_queue
+from app.redis_client import check_idempotency
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -30,6 +31,7 @@ async def ingest_event(body: IngestEventBody) -> JSONResponse:
         )
 
     await push_to_queue(body.event_id, body.source, body.payload)
+    events_ingested_total.labels(source=body.source).inc()
     return JSONResponse(
         status_code=202,
         content={"status": "accepted", "event_id": body.event_id},
