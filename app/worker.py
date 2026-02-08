@@ -16,10 +16,16 @@ import time
 import redis.asyncio as redis
 
 from app.config import settings
-from app.db import close_pool, get_pool, init_schema, insert_event
-from app.metrics import messages_dlq_total, messages_failed_total, messages_processed_total
+from app.db import close_pool, get_pool, get_latest_event_type, init_schema, insert_event
+from app.metrics import (
+    events_rejected_invalid_transition_total,
+    messages_dlq_total,
+    messages_failed_total,
+    messages_processed_total,
+)
+from app.order_state import is_valid_transition
 from app.queue import INGESTION_DLQ_KEY, INGESTION_QUEUE_KEY
-from app.sqs_client import change_message_visibility, delete_message, receive_messages
+from app.sqs_client import change_message_visibility, delete_message, receive_messages, send_message_to_dlq
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,18 +56,48 @@ async def process_one_redis(
         logger.warning("Invalid JSON from queue: %s", e)
         return
     event_id = data.get("event_id")
-    source = data.get("source", "order_updates")
+    order_id = data.get("order_id")
+    event_type = data.get("event_type")
+    event_version = data.get("event_version", 1)
     payload = data.get("payload") or {}
     attempts = data.get("attempts", 0)
     if not event_id:
         logger.warning("Message missing event_id, skipping")
         return
+    if not order_id or not event_type:
+        logger.warning("Message missing order_id or event_type, skipping")
+        return
 
     async with sem:
+        current_state = await get_latest_event_type(pool, order_id)
+        if not is_valid_transition(current_state, event_type):
+            events_rejected_invalid_transition_total.labels(
+                current_state=current_state or "none",
+                attempted_event_type=event_type,
+            ).inc()
+            dlq_message = json.dumps({
+                "event_id": event_id,
+                "order_id": order_id,
+                "event_type": event_type,
+                "event_version": event_version,
+                "payload": payload,
+                "attempts": attempts,
+                "reason": "invalid_transition",
+                "current_state": current_state,
+                "attempted_event_type": event_type,
+                "rejected_at": time.time(),
+            })
+            await r.lpush(INGESTION_DLQ_KEY, dlq_message)
+            messages_dlq_total.inc()
+            logger.warning(
+                "Rejected invalid transition order_id=%s current=%s attempted=%s -> DLQ",
+                order_id, current_state, event_type,
+            )
+            return
         try:
-            inserted = await insert_event(pool, event_id, source, payload)
+            inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
             if inserted:
-                logger.info("Processed event_id=%s", event_id)
+                logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
                 messages_processed_total.inc()
             else:
                 logger.info("Duplicate event_id=%s (UNIQUE constraint), skipped", event_id)
@@ -73,7 +109,9 @@ async def process_one_redis(
             if next_attempts >= settings.worker_max_retries:
                 dlq_message = json.dumps({
                     "event_id": event_id,
-                    "source": source,
+                    "order_id": order_id,
+                    "event_type": event_type,
+                    "event_version": event_version,
                     "payload": payload,
                     "attempts": next_attempts,
                     "last_error": str(e),
@@ -88,7 +126,9 @@ async def process_one_redis(
                 await asyncio.sleep(backoff_sec)
                 retry_message = json.dumps({
                     "event_id": event_id,
-                    "source": source,
+                    "order_id": order_id,
+                    "event_type": event_type,
+                    "event_version": event_version,
                     "payload": payload,
                     "attempts": next_attempts,
                 })
@@ -108,17 +148,46 @@ async def process_one_sqs(
         logger.warning("Invalid JSON from SQS")
         return
     event_id = data.get("event_id")
-    source = data.get("source", "order_updates")
+    order_id = data.get("order_id")
+    event_type = data.get("event_type")
+    event_version = data.get("event_version", 1)
     payload = data.get("payload") or {}
     if not event_id:
         logger.warning("Message missing event_id, skipping")
         return
+    if not order_id or not event_type:
+        logger.warning("Message missing order_id or event_type, skipping")
+        return
 
     async with sem:
+        current_state = await get_latest_event_type(pool, order_id)
+        if not is_valid_transition(current_state, event_type):
+            events_rejected_invalid_transition_total.labels(
+                current_state=current_state or "none",
+                attempted_event_type=event_type,
+            ).inc()
+            dlq_body = {
+                "event_id": event_id,
+                "order_id": order_id,
+                "event_type": event_type,
+                "event_version": event_version,
+                "payload": payload,
+                "reason": "invalid_transition",
+                "current_state": current_state,
+                "attempted_event_type": event_type,
+                "rejected_at": time.time(),
+            }
+            await send_message_to_dlq(dlq_body)
+            await asyncio.to_thread(delete_message, receipt_handle)
+            logger.warning(
+                "Rejected invalid transition order_id=%s current=%s attempted=%s (deleted from queue)",
+                order_id, current_state, event_type,
+            )
+            return
         try:
-            inserted = await insert_event(pool, event_id, source, payload)
+            inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
             if inserted:
-                logger.info("Processed event_id=%s", event_id)
+                logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
                 messages_processed_total.inc()
                 await asyncio.to_thread(delete_message, receipt_handle)
             else:

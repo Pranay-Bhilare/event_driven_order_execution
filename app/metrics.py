@@ -3,11 +3,11 @@ Prometheus metrics: events ingested (API), messages processed/failed (worker), q
 """
 from prometheus_client import Counter, Gauge, generate_latest
 
-# API: events accepted for ingestion
+# API: events accepted for ingestion (by order lifecycle event type)
 events_ingested_total = Counter(
     "events_ingested_total",
-    "Total events accepted (202) for ingestion",
-    ["source"],
+    "Total order lifecycle events accepted (202) for ingestion",
+    ["event_type"],
 )
 
 # Worker: processing outcomes
@@ -22,6 +22,11 @@ messages_failed_total = Counter(
 messages_dlq_total = Counter(
     "messages_dlq_total",
     "Total messages moved to DLQ after max retries",
+)
+events_rejected_invalid_transition_total = Counter(
+    "events_rejected_invalid_transition_total",
+    "Total events rejected due to invalid order lifecycle transition",
+    ["current_state", "attempted_event_type"],
 )
 
 # SQS queue depth (when using SQS) - backpressure / consumer lag

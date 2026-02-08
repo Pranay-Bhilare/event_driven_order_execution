@@ -1,5 +1,5 @@
 """
-Push event payload to queue. Backend: Redis (LPUSH) or AWS SQS when SQS_QUEUE_URL is set.
+Push order lifecycle event to queue. Backend: Redis (LPUSH) or AWS SQS when SQS_QUEUE_URL is set.
 """
 import json
 
@@ -11,17 +11,33 @@ INGESTION_QUEUE_KEY = "queue:ingestion_events"
 INGESTION_DLQ_KEY = "queue:ingestion_events:dlq"
 
 
-def _make_body(event_id: str, source: str, payload: dict, attempts: int = 0) -> dict:
+def _make_body(
+    event_id: str,
+    order_id: str,
+    event_type: str,
+    event_version: int,
+    payload: dict,
+    attempts: int = 0,
+) -> dict:
     return {
         "event_id": event_id,
-        "source": source,
+        "order_id": order_id,
+        "event_type": event_type,
+        "event_version": event_version,
         "payload": payload,
         "attempts": attempts,
     }
 
 
-async def push_to_queue(event_id: str, source: str, payload: dict, attempts: int = 0) -> None:
-    body = _make_body(event_id, source, payload, attempts)
+async def push_to_queue(
+    event_id: str,
+    order_id: str,
+    event_type: str,
+    event_version: int,
+    payload: dict,
+    attempts: int = 0,
+) -> None:
+    body = _make_body(event_id, order_id, event_type, event_version, payload, attempts)
     if settings.sqs_queue_url:
         await send_message(body)
     else:

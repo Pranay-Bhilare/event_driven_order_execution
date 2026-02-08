@@ -29,6 +29,18 @@ async def send_message(body: dict) -> None:
     )
 
 
+async def send_message_to_dlq(body: dict) -> None:
+    """Send message to DLQ when configured. No-op if sqs_dlq_url is not set."""
+    if not settings.sqs_dlq_url:
+        return
+    client = _get_client()
+    await asyncio.to_thread(
+        client.send_message,
+        QueueUrl=settings.sqs_dlq_url,
+        MessageBody=json.dumps(body),
+    )
+
+
 def receive_messages(max_number: int = 10, wait_seconds: int = 5) -> list[dict]:
     """Sync receive (used by worker in thread). Returns list of {ReceiptHandle, Body}."""
     client = _get_client()
