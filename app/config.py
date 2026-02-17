@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     worker_max_retries: int = 5  # after this many attempts, move to DLQ (attempts 0..4 = 5 tries)
     db_slowdown_ms: int = 400  # artificial delay per insert (e.g. 200 for backpressure tests)
 
-    # AWS SQS (optional): when set, API/worker use SQS instead of Redis queue
+    # AWS SQS (required for queue): main queue and DLQ
     aws_region: str = "ap-south-1"
     sqs_queue_url: str | None = None
     sqs_dlq_url: str | None = None

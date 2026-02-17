@@ -91,3 +91,73 @@ async def get_queue_depth() -> tuple[int, int]:
         )
 
     return await asyncio.to_thread(_get)
+
+
+def receive_messages_from_dlq(max_number: int = 10, wait_seconds: int = 0) -> list[dict]:
+    """Receive messages from DLQ. Returns list of {ReceiptHandle, Body}."""
+    if not settings.sqs_dlq_url:
+        return []
+    client = _get_client()
+    resp = client.receive_message(
+        QueueUrl=settings.sqs_dlq_url,
+        MaxNumberOfMessages=max_number,
+        WaitTimeSeconds=wait_seconds,
+    )
+    return resp.get("Messages") or []
+
+
+def delete_message_from_dlq(receipt_handle: str) -> None:
+    """Delete message from DLQ after processing."""
+    if not settings.sqs_dlq_url:
+        return
+    client = _get_client()
+    client.delete_message(
+        QueueUrl=settings.sqs_dlq_url,
+        ReceiptHandle=receipt_handle,
+    )
+
+
+async def replay_dlq_to_main(limit: int = 100) -> int:
+    """
+    Read messages from DLQ, re-send event payload to main queue, delete from DLQ.
+    Returns number of messages replayed.
+    """
+    if not settings.sqs_dlq_url or not settings.sqs_queue_url:
+        return 0
+    replayed = 0
+    while replayed < limit:
+        messages = await asyncio.to_thread(receive_messages_from_dlq, 10, 0)
+        if not messages:
+            break
+        for msg in messages:
+            if replayed >= limit:
+                break
+            body_str = msg.get("Body") or "{}"
+            receipt = msg.get("ReceiptHandle") or ""
+            try:
+                data = json.loads(body_str)
+            except json.JSONDecodeError:
+                await asyncio.to_thread(delete_message_from_dlq, receipt)
+                replayed += 1
+                continue
+            event_id = data.get("event_id")
+            order_id = data.get("order_id")
+            event_type = data.get("event_type")
+            event_version = data.get("event_version", 1)
+            payload = data.get("payload") or {}
+            if not event_id or not order_id or not event_type:
+                await asyncio.to_thread(delete_message_from_dlq, receipt)
+                replayed += 1
+                continue
+            main_body = {
+                "event_id": event_id,
+                "order_id": order_id,
+                "event_type": event_type,
+                "event_version": event_version,
+                "payload": payload,
+                "attempts": 0,
+            }
+            await send_message(main_body)
+            await asyncio.to_thread(delete_message_from_dlq, receipt)
+            replayed += 1
+    return replayed

@@ -5,7 +5,7 @@ from fastapi.responses import Response
 
 from app.metrics import get_metrics_bytes, get_metrics_content_type, sqs_queue_messages_in_flight, sqs_queue_messages_waiting
 from app.redis_client import close_redis, get_redis
-from app.routes import events
+from app.routes import admin, events
 from app.sqs_client import get_queue_depth
 
 
@@ -18,6 +18,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ingestion Engine", lifespan=lifespan)
 app.include_router(events.router)
+app.include_router(admin.router)
 
 
 @app.get("/health")

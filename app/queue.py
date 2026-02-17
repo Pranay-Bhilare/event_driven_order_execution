@@ -1,14 +1,10 @@
 """
-Push order lifecycle event to queue. Backend: Redis (LPUSH) or AWS SQS when SQS_QUEUE_URL is set.
+Push order lifecycle event to SQS. SQS only.
 """
 import json
 
 from app.config import settings
-from app.redis_client import get_redis
 from app.sqs_client import send_message
-
-INGESTION_QUEUE_KEY = "queue:ingestion_events"
-INGESTION_DLQ_KEY = "queue:ingestion_events:dlq"
 
 
 def _make_body(
@@ -37,9 +33,7 @@ async def push_to_queue(
     payload: dict,
     attempts: int = 0,
 ) -> None:
+    if not settings.sqs_queue_url:
+        raise RuntimeError("SQS_QUEUE_URL is required")
     body = _make_body(event_id, order_id, event_type, event_version, payload, attempts)
-    if settings.sqs_queue_url:
-        await send_message(body)
-    else:
-        r = await get_redis()
-        await r.lpush(INGESTION_QUEUE_KEY, json.dumps(body))
+    await send_message(body)

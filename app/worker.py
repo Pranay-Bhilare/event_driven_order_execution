@@ -1,8 +1,8 @@
 """
-Worker: pull messages from Redis or AWS SQS, insert into Postgres.
-- Redis: exponential backoff + manual DLQ. SQS: don't delete on failure; SQS redrive to DLQ after max receives.
-- Prometheus /metrics on port 9090 (worker metrics).
-- Graceful shutdown on SIGTERM.
+Worker: pull messages from SQS, process each event in a single DB transaction.
+- Insert event first, then lock order row (FOR UPDATE), validate transition, update orders.current_state.
+- SQS message deleted only after successful commit.
+- Prometheus /metrics on port 9090. Graceful shutdown on SIGTERM.
 Run: python -m app.worker
 """
 import asyncio
@@ -13,18 +13,20 @@ import sys
 import threading
 import time
 
-import redis.asyncio as redis
-
 from app.config import settings
-from app.db import close_pool, get_pool, get_latest_event_type, init_schema, insert_event
+from app.db import (
+    DuplicateEventError,
+    InvalidTransitionError,
+    close_pool,
+    get_pool,
+    init_schema,
+    process_event_transaction,
+)
 from app.metrics import (
     events_rejected_invalid_transition_total,
-    messages_dlq_total,
     messages_failed_total,
     messages_processed_total,
 )
-from app.order_state import is_valid_transition
-from app.queue import INGESTION_DLQ_KEY, INGESTION_QUEUE_KEY
 from app.sqs_client import change_message_visibility, delete_message, receive_messages, send_message_to_dlq
 
 logging.basicConfig(
@@ -34,7 +36,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-BRPOP_TIMEOUT = 5
 GRACEFUL_SHUTDOWN_WAIT_SEC = 30
 WORKER_METRICS_PORT = 9090
 
@@ -42,99 +43,6 @@ WORKER_METRICS_PORT = 9090
 def _start_metrics_server() -> None:
     from prometheus_client import start_http_server
     start_http_server(WORKER_METRICS_PORT)
-
-
-async def process_one_redis(
-    r: redis.Redis,
-    pool,
-    raw: str,
-    sem: asyncio.Semaphore,
-) -> None:
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError as e:
-        logger.warning("Invalid JSON from queue: %s", e)
-        return
-    event_id = data.get("event_id")
-    order_id = data.get("order_id")
-    event_type = data.get("event_type")
-    event_version = data.get("event_version", 1)
-    payload = data.get("payload") or {}
-    attempts = data.get("attempts", 0)
-    if not event_id:
-        logger.warning("Message missing event_id, skipping")
-        return
-    if not order_id or not event_type:
-        logger.warning("Message missing order_id or event_type, skipping")
-        return
-
-    async with sem:
-        current_state = await get_latest_event_type(pool, order_id)
-        if not is_valid_transition(current_state, event_type):
-            events_rejected_invalid_transition_total.labels(
-                current_state=current_state or "none",
-                attempted_event_type=event_type,
-            ).inc()
-            dlq_message = json.dumps({
-                "event_id": event_id,
-                "order_id": order_id,
-                "event_type": event_type,
-                "event_version": event_version,
-                "payload": payload,
-                "attempts": attempts,
-                "reason": "invalid_transition",
-                "current_state": current_state,
-                "attempted_event_type": event_type,
-                "rejected_at": time.time(),
-            })
-            await r.lpush(INGESTION_DLQ_KEY, dlq_message)
-            messages_dlq_total.inc()
-            logger.warning(
-                "Rejected invalid transition order_id=%s current=%s attempted=%s -> DLQ",
-                order_id, current_state, event_type,
-            )
-            return
-        try:
-            if settings.db_slowdown_ms > 0:
-                await asyncio.sleep(settings.db_slowdown_ms / 1000.0)
-            inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
-            if inserted:
-                logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
-                messages_processed_total.inc()
-            else:
-                logger.info("Duplicate event_id=%s (UNIQUE constraint), skipped", event_id)
-                messages_processed_total.inc()
-        except Exception as e:
-            messages_failed_total.inc()
-            logger.exception("Failed to process event_id=%s (attempt %d): %s", event_id, attempts + 1, e)
-            next_attempts = attempts + 1
-            if next_attempts >= settings.worker_max_retries:
-                dlq_message = json.dumps({
-                    "event_id": event_id,
-                    "order_id": order_id,
-                    "event_type": event_type,
-                    "event_version": event_version,
-                    "payload": payload,
-                    "attempts": next_attempts,
-                    "last_error": str(e),
-                    "failed_at": time.time(),
-                })
-                await r.lpush(INGESTION_DLQ_KEY, dlq_message)
-                messages_dlq_total.inc()
-                logger.warning("Moved event_id=%s to DLQ after %d attempts", event_id, settings.worker_max_retries)
-            else:
-                backoff_sec = 2 ** attempts
-                logger.info("Re-queuing event_id=%s in %ds (attempt %d/%d)", event_id, backoff_sec, next_attempts, settings.worker_max_retries)
-                await asyncio.sleep(backoff_sec)
-                retry_message = json.dumps({
-                    "event_id": event_id,
-                    "order_id": order_id,
-                    "event_type": event_type,
-                    "event_version": event_version,
-                    "payload": payload,
-                    "attempts": next_attempts,
-                })
-                await r.lpush(INGESTION_QUEUE_KEY, retry_message)
 
 
 async def process_one_sqs(
@@ -162,10 +70,15 @@ async def process_one_sqs(
         return
 
     async with sem:
-        current_state = await get_latest_event_type(pool, order_id)
-        if not is_valid_transition(current_state, event_type):
+        if settings.db_slowdown_ms > 0:
+            await asyncio.sleep(settings.db_slowdown_ms / 1000.0)
+        try:
+            result = await process_event_transaction(
+                pool, event_id, order_id, event_type, event_version, payload
+            )
+        except InvalidTransitionError as e:
             events_rejected_invalid_transition_total.labels(
-                current_state=current_state or "none",
+                current_state=e.current_state or "none",
                 attempted_event_type=event_type,
             ).inc()
             dlq_body = {
@@ -175,77 +88,36 @@ async def process_one_sqs(
                 "event_version": event_version,
                 "payload": payload,
                 "reason": "invalid_transition",
-                "current_state": current_state,
-                "attempted_event_type": event_type,
+                "current_state": e.current_state,
                 "rejected_at": time.time(),
             }
             await send_message_to_dlq(dlq_body)
             await asyncio.to_thread(delete_message, receipt_handle)
-            logger.warning(
-                "Rejected invalid transition order_id=%s current=%s attempted=%s (deleted from queue)",
-                order_id, current_state, event_type,
-            )
             return
-        try:
-            if settings.db_slowdown_ms > 0:
-                await asyncio.sleep(settings.db_slowdown_ms / 1000.0)
-            inserted = await insert_event(pool, event_id, order_id, event_type, event_version, payload)
-            if inserted:
-                logger.info("Processed event_id=%s order_id=%s %s", event_id, order_id, event_type)
-                messages_processed_total.inc()
-                await asyncio.to_thread(delete_message, receipt_handle)
-            else:
-                logger.info("Duplicate event_id=%s (UNIQUE constraint), skipped", event_id)
-                messages_processed_total.inc()
-                await asyncio.to_thread(delete_message, receipt_handle)
+        except DuplicateEventError:
+            messages_processed_total.inc()
+            await asyncio.to_thread(delete_message, receipt_handle)
+            return
         except Exception as e:
             messages_failed_total.inc()
             logger.exception("Failed to process event_id=%s (receive #%d): %s", event_id, receive_count, e)
-            # Don't delete: message will reappear after visibility timeout; after max receives SQS moves to DLQ
             backoff = min(2 ** receive_count, 900)
             await asyncio.to_thread(change_message_visibility, receipt_handle, backoff)
+            return
+
+        if result == "inserted":
+            messages_processed_total.inc()
+            await asyncio.to_thread(delete_message, receipt_handle)
 
 
-async def run_worker_redis(shutdown_event: asyncio.Event) -> None:
+async def run_worker(shutdown_event: asyncio.Event) -> None:
+    if not settings.sqs_queue_url:
+        raise RuntimeError("SQS_QUEUE_URL is required")
     pool = await get_pool()
     await init_schema(pool)
     sem = asyncio.Semaphore(settings.worker_concurrency)
     logger.info(
-        "Schema ready. Backend=Redis. Listening on %s (concurrency=%d, max_retries=%d) ...",
-        INGESTION_QUEUE_KEY,
-        settings.worker_concurrency,
-        settings.worker_max_retries,
-    )
-    r = redis.from_url(settings.redis_url, decode_responses=True)
-    tasks: set[asyncio.Task] = set()
-    try:
-        while not shutdown_event.is_set():
-            result = await r.brpop(INGESTION_QUEUE_KEY, timeout=BRPOP_TIMEOUT)
-            if result is None:
-                continue
-            _key, raw = result
-            t = asyncio.create_task(process_one_redis(r, pool, raw, sem))
-            tasks.add(t)
-            t.add_done_callback(tasks.discard)
-    finally:
-        if tasks:
-            logger.info("Graceful shutdown: waiting for %d in-flight task(s) (max %ds) ...", len(tasks), GRACEFUL_SHUTDOWN_WAIT_SEC)
-            _, pending = await asyncio.wait(tasks, timeout=GRACEFUL_SHUTDOWN_WAIT_SEC, return_when=asyncio.ALL_COMPLETED)
-            for t in pending:
-                t.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-        await r.aclose()
-        await close_pool()
-        logger.info("Worker stopped.")
-
-
-async def run_worker_sqs(shutdown_event: asyncio.Event) -> None:
-    pool = await get_pool()
-    await init_schema(pool)
-    sem = asyncio.Semaphore(settings.worker_concurrency)
-    logger.info(
-        "Schema ready. Backend=SQS. Queue=%s (concurrency=%d) ...",
+        "Schema ready. SQS queue=%s (concurrency=%d) ...",
         settings.sqs_queue_url,
         settings.worker_concurrency,
     )
@@ -263,7 +135,10 @@ async def run_worker_sqs(shutdown_event: asyncio.Event) -> None:
                 t.add_done_callback(tasks.discard)
     finally:
         if tasks:
-            logger.info("Graceful shutdown: waiting for %d in-flight task(s) (max %ds) ...", len(tasks), GRACEFUL_SHUTDOWN_WAIT_SEC)
+            logger.info(
+                "Graceful shutdown: waiting for %d in-flight task(s) (max %ds) ...",
+                len(tasks), GRACEFUL_SHUTDOWN_WAIT_SEC,
+            )
             _, pending = await asyncio.wait(tasks, timeout=GRACEFUL_SHUTDOWN_WAIT_SEC, return_when=asyncio.ALL_COMPLETED)
             for t in pending:
                 t.cancel()
@@ -271,13 +146,6 @@ async def run_worker_sqs(shutdown_event: asyncio.Event) -> None:
                 await asyncio.gather(*pending, return_exceptions=True)
         await close_pool()
         logger.info("Worker stopped.")
-
-
-async def run_worker(shutdown_event: asyncio.Event) -> None:
-    if settings.sqs_queue_url:
-        await run_worker_sqs(shutdown_event)
-    else:
-        await run_worker_redis(shutdown_event)
 
 
 def main() -> None:
