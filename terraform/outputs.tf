@@ -15,3 +15,18 @@ output "dlq_url" {
 output "dlq_arn" {
   value = aws_sqs_queue.dlq.arn
 }
+
+output "app_instance_public_ip" {
+  description = "Public IP of the EC2 instance running the app"
+  value       = aws_instance.app.public_ip
+}
+
+output "rds_endpoint" {
+  description = "RDS PostgreSQL endpoint (host:port)"
+  value       = aws_db_instance.postgres.endpoint
+}
+
+output "rds_database_name" {
+  description = "RDS PostgreSQL database name"
+  value       = aws_db_instance.postgres.db_name
+}

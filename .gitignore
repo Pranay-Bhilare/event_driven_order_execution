@@ -30,3 +30,5 @@ Thumbs.db
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+
+docs/*.md
