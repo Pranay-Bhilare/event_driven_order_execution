@@ -63,14 +63,6 @@ async def init_schema(pool: asyncpg.Pool) -> None:
             );
         """)
         await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ingestion_events_order_id
-            ON ingestion_events(order_id);
-        """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_ingestion_events_event_type
-            ON ingestion_events(event_type);
-        """)
-        await conn.execute("""
             CREATE TABLE orders (
                 order_id VARCHAR(255) PRIMARY KEY,
                 current_state VARCHAR(50) NOT NULL,

@@ -10,8 +10,9 @@ import json
 import logging
 import signal
 import sys
-import threading
 import time
+
+from prometheus_client import start_http_server
 
 from app.config import settings
 from app.db import (
@@ -38,11 +39,6 @@ logger = logging.getLogger(__name__)
 
 GRACEFUL_SHUTDOWN_WAIT_SEC = 30
 WORKER_METRICS_PORT = 9090
-
-
-def _start_metrics_server() -> None:
-    from prometheus_client import start_http_server
-    start_http_server(WORKER_METRICS_PORT)
 
 
 async def process_one_sqs(
@@ -149,7 +145,7 @@ async def run_worker(shutdown_event: asyncio.Event) -> None:
 
 
 def main() -> None:
-    threading.Thread(target=_start_metrics_server, daemon=True).start()
+    start_http_server(WORKER_METRICS_PORT)
     logger.info("Metrics server listening on port %s", WORKER_METRICS_PORT)
 
     shutdown_event = asyncio.Event()
