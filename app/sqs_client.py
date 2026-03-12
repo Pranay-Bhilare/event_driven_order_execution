@@ -126,7 +126,7 @@ async def replay_dlq_to_main(limit: int = 100) -> int:
         return 0
     replayed = 0
     while replayed < limit:
-        messages = await asyncio.to_thread(receive_messages_from_dlq, 10, 0)
+        messages = await asyncio.to_thread(receive_messages_from_dlq, 10, 5)
         if not messages:
             break
         for msg in messages:

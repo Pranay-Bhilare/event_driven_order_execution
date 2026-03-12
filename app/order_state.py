@@ -3,12 +3,13 @@ Order lifecycle state machine. Valid transitions enforce business rules.
 """
 
 # Current state -> allowed next event_type
-VALID_TRANSITIONS: dict[str | None, list[str]] = {
+VALID_TRANSITIONS = {
     None: ["ORDER_CREATED"],
-    "ORDER_CREATED": ["PAYMENT_CONFIRMED"],
-    "PAYMENT_CONFIRMED": ["ORDER_SHIPPED"],
-    "ORDER_SHIPPED": ["ORDER_DELIVERED"],
-    "ORDER_DELIVERED": [],  # terminal
+    "ORDER_CREATED": ["PAYMENT_CONFIRMED", "ORDER_CANCELLED"],
+    "PAYMENT_CONFIRMED": ["ORDER_SHIPPED", "ORDER_CANCELLED"],
+    "ORDER_SHIPPED": ["ORDER_DELIVERED", "ORDER_CANCELLED"], # Return flow alag hota hai
+    "ORDER_DELIVERED": [],
+    "ORDER_CANCELLED": [], # Terminal state
 }
 
 
